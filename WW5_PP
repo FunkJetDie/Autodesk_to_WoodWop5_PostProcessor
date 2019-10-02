@@ -1,0 +1,369 @@
+description = "Generic woodWOP";
+vendor = "HOMAG";
+certificationLevel = 2;
+minimumRevision = 24000;
+
+extension = "mpr";
+setCodePage("ascii");
+
+tolerance = spatial(0.002, MM);
+
+minimumChordLength = spatial(0.01, MM);
+minimumCircularRadius = spatial(0.3, MM); // avoid errors with smaller radii
+maximumCircularRadius = spatial(1000, MM);
+minimumCircularSweep = toRad(0.01);
+maximumCircularSweep = toRad(180); // limit to 180deg for now to work around issues with 360deg arcs
+allowHelicalMoves = true;
+allowedCircularPlanes = (1 << PLANE_XY); // allow any circular motion
+
+
+
+// user-defined properties
+properties = {
+  doAllDrillingFirst: true, // Enable to reorder toolpath to do all drilling first
+  freeMotionParkPosition: 1, // specifies where the machine should park after cutting 0-4
+  freeMotionAdditional: 0 // specifies how much to add to the free motion park position (in mm)
+};
+
+
+
+var gFormat = createFormat({prefix:"G", decimals:0});
+
+var xyzFormat = createFormat({decimals:3});
+var rFormat = createFormat({decimals:3});
+var spatialFormat = createFormat({decimals:3});
+var feedFormat = createFormat({decimals:3, scale:0.001});
+
+var xOutput = createVariable({prefix:"X"}, xyzFormat);
+var yOutput = createVariable({prefix:"Y"}, xyzFormat);
+var zOutput = createVariable({prefix:"Z"}, xyzFormat);
+
+// collected state
+var inContour = false;
+var contourId = 0;
+var entityId = 0;
+var currentFeed = -1;
+var machining = [];
+
+/**
+  Writes the specified block.
+*/
+function writeBlock() {
+  writeWords(arguments);
+}
+
+/**
+  Output a comment.
+*/
+function writeComment(text) {
+  writeBlock("\\ " + text);
+}
+
+function writeVal(name, value) {
+  writeln(name + "=" + value);
+}
+
+function writeVar(name, value) {
+  writeln(name + "=\"" + value + "\"");
+}
+
+function onOpen() {
+
+  switch (unit) {
+  case IN:
+    xyzFormat = createFormat({decimals:3, scale:25.4});
+    rFormat = createFormat({decimals:3, scale:25.4});
+    spatialFormat = createFormat({decimals:3, scale:25.4});
+    feedFormat = createFormat({decimals:3, scale:25.4 * 0.001});
+
+    xOutput = createVariable({prefix:"X"}, xyzFormat);
+    yOutput = createVariable({prefix:"Y"}, xyzFormat);
+    zOutput = createVariable({prefix:"Z"}, xyzFormat);
+
+    break;
+  case MM:
+    break;
+  }
+
+  if (programName) {
+    writeComment(programName);
+  }
+  if (programComment) {
+    writeComment(programComment);
+  }
+
+  writeln("[H");
+  writeVar("VERSION", "4.0");
+  writeVar("INCH", 0 /*(unit == IN) ? 1 : 0*/); // 0 mm, 1 inch // we map inches to mm
+  writeVar("MAT", "WEEKE"); // HOMAG, CF-HOMAG, FK-HOMAG, WEEKE
+  writeVar("OP", properties.doAllDrillingFirst ? 1 : 0);
+  writeVar("FM", properties.freeMotionParkPosition); // free motion part posisiton 0-4
+  writeVar("FW", spatialFormat.format(properties.freeMotionAdditional)); // in mm
+
+  writeln("");
+  writeln("[001");
+  /*
+  writeVar("L", 0);
+  writeVar("KM", "");
+  writeVar("B", 0);
+  writeVar("KM", "");
+  writeVar("D", 0);
+  writeVar("KM", "");
+  */
+  writeVar("X", 0);
+  writeVar("KM", "");
+  writeVar("Y", 0);
+  writeVar("KM", "");
+
+  { // stock - workpiece
+    var workpiece = getWorkpiece();
+    var delta = Vector.diff(workpiece.upper, workpiece.lower);
+    if (delta.isNonZero()) {
+      writeln("");
+      writeln("<100 \\WerkStck\\");
+      writeVar("LA", spatialFormat.format(delta.x));
+      writeVar("BR", spatialFormat.format(delta.y));
+      writeVar("DI", spatialFormat.format(delta.z));
+
+      writeVar("FNX", spatialFormat.format(0));
+      writeVar("FNY", spatialFormat.format(0));
+      writeVar("AX", spatialFormat.format(0));
+      writeVar("AY", spatialFormat.format(0));
+    }
+  }
+
+  writeln("");
+  writeln("[K");
+  writeln("<00 \\Koordinatensystem\\");
+  writeVar("NR", "F0");
+  writeVar("XP", 0);
+  writeVar("XF", 1);
+  writeVar("YP", 0);
+  writeVar("YF", 1);
+  writeVar("ZP", 0);
+  writeVar("ZF", 1);
+  writeVar("D1", 0);
+  writeVar("KI", 0);
+  writeVar("D2", 0);
+  writeVar("MI", 0);
+}
+
+function onComment(message) {
+  writeComment(message);
+}
+
+function onParameter(name, value) {
+}
+
+function onSection() {
+  { // pure 3D
+    var remaining = currentSection.workPlane;
+    if (!isSameDirection(remaining.forward, new Vector(0, 0, 1))) {
+      error(localize("Tool orientation is not supported."));
+      return;
+    }
+    setRotation(remaining);
+  }
+}
+
+function onDwell(seconds) {
+}
+
+function onCycle() {
+}
+
+function onCyclePoint(x, y, z) {
+  machining.push({id:-1, sectionId:getCurrentSectionId(), p:new Vector(x, y, z), cycle:cycle});
+}
+
+function onCycleEnd() {
+  if (!cycleExpanded) {
+    zOutput.reset();
+  }
+}
+
+var pendingRadiusCompensation = -1;
+
+function onRadiusCompensation() {
+  pendingRadiusCompensation = radiusCompensation;
+}
+
+function onRapid(x, y, z) {
+  if (pendingRadiusCompensation >= 0) {
+    error(localize("Radius compensation is not supported."));
+    return;
+  }
+
+  if (inContour) {
+    machining.push({id:contourId, sectionId:getCurrentSectionId(), entities:entityId, feed:currentFeed});
+    inContour = false;
+  }
+}
+
+function onLinear(x, y, z, feed) {
+  if (pendingRadiusCompensation >= 0) {
+    error(localize("Radius compensation is not supported."));
+    return;
+  }
+
+/*
+  if ((movement != MOVEMENT_CUTTING) && (movement != MOVEMENT_FINISH_CUTTING)) {
+    if (inContour) {
+      machining.push({id:contourId, sectionId:getCurrentSectionId(), entities:entityId, feed:currentFeed});
+      inContour = false;
+    }
+    return;
+  }
+*/
+
+  if (!inContour) {
+    writeln("");
+    writeln("]" + contourId);
+    contourId += 1;
+    entityId = 0;
+
+    var start = getCurrentPosition(); 
+    writeln("");
+    writeln("$E" + entityId);
+    writeln("KP");
+    writeVal("X", xyzFormat.format(start.x));
+    writeVal("Y", xyzFormat.format(start.y));
+    writeVal("Z", xyzFormat.format(start.z));
+    entityId += 1;
+
+    currentFeed = feed;
+    inContour = true;
+  }
+
+  if ((movement == MOVEMENT_CUTTING) || (movement == MOVEMENT_FINISH_CUTTING)) {
+    currentFeed = feed;
+  }
+  // currentFeed = Math.min(currentFeed, feed);
+  
+  writeln("");
+  writeln("$E" + entityId);
+  writeln("KL");
+  writeVal("X", xyzFormat.format(x));
+  writeVal("Y", xyzFormat.format(y));
+  writeVal("Z", xyzFormat.format(z));
+  entityId += 1;
+}
+
+function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
+  if (pendingRadiusCompensation >= 0) {
+    error(localize("Radius compensation cannot be activated/deactivated for a circular move."));
+    return;
+  }
+
+/*
+  if ((movement != MOVEMENT_CUTTING) && (movement != MOVEMENT_FINISH_CUTTING)) {
+    if (inContour) {
+      machining.push({id:contourId, sectionId:getCurrentSectionId(), entities:entityId, feed:currentFeed});
+      inContour = false;
+    }
+    return;
+  }
+*/
+
+  if (!inContour) {
+    writeln("");
+    writeln("]" + contourId);
+    contourId += 1;
+    entityId = 0;
+
+    var start = getCurrentPosition(); 
+    writeln("");
+    writeln("$E" + entityId);
+    writeln("KP");
+    writeVal("X", xyzFormat.format(start.x));
+    writeVal("Y", xyzFormat.format(start.y));
+    writeVal("Z", xyzFormat.format(start.z));
+    entityId += 1;
+
+    currentFeed = feed;
+    inContour = true;
+  }
+
+  if ((movement == MOVEMENT_CUTTING) || (movement == MOVEMENT_FINISH_CUTTING)) {
+    currentFeed = feed;
+  }
+  // currentFeed = Math.min(currentFeed, feed);
+
+  switch (getCircularPlane()) {
+  case PLANE_XY:
+    writeln("");
+    writeln("$E" + entityId);
+    writeln("KA");
+    writeVal("X", xyzFormat.format(x));
+    writeVal("Y", xyzFormat.format(y));
+    writeVal("Z", xyzFormat.format(z));
+    // var ip = getPositionU(0.5);
+    // writeVal("I", xyzFormat.format(ip.x));
+    // writeVal("J", xyzFormat.format(ip.y));
+    // writeVal("K", xyzFormat.format(ip.z));
+    writeVal("R", rFormat.format(getCircularRadius() + toPreciseUnit(0.002, MM))); // around rounding issue
+    var small = Math.abs(getCircularSweep()) <= Math.PI;
+    if (small) {
+      writeVal("DS", clockwise ? 0 : 1);
+    } else {
+      writeVal("DS", clockwise ? 2 : 3);
+    }
+    entityId += 1;
+    break;
+  default:
+    linearize(tolerance);
+  }
+}
+
+function onCommand(command) {
+}
+
+function onSectionEnd() {
+  if (inContour) {
+    machining.push({id:contourId, sectionId:getCurrentSectionId(), entities:entityId, feed:currentFeed});
+    inContour = false;
+  }
+}
+
+function onClose() {
+
+  for (var i = 0; i < machining.length; ++i) {
+    var m = machining[i];
+    var tool = getSection(m.sectionId).getTool();
+    writeln("");
+
+    if (m.id < 0) {
+      writeln("<102 \\BohrVert\\");
+      writeVar("XA", xyzFormat.format(m.p.x));
+      writeVar("YA", xyzFormat.format(m.p.y));
+      writeVar("TI", xyzFormat.format(m.cycle.depth));
+      writeVar("TNO", tool.number);
+      writeVar("F_", feedFormat.format(m.cycle.feedrate));
+    } else {
+      writeln("<105 \\Konturfraesen\\");
+      writeVar("EA", m.id + ":" + 0);
+      writeVar("MDA", "SEN");
+      writeVar("EE", m.id + ":" + (m.entities - 1));
+      writeVar("MDE", "SEN_AB");
+      writeVar("RK", "NOWRK");
+      writeVar("TNO", tool.number);
+      writeVar("ZA", "@0"); // ignore all Z in program
+      writeVar("F_", feedFormat.format(m.feed));
+      writeVar("SM", 1); // rpm
+      writeVar("S_A", tool.spindleRPM);
+    }
+  }
+
+  writeln("");
+  writeln("<101 \\Kommentar\\");
+  if (programName) {
+    writeVar("KM", programName);
+  }
+  if (programComment) {
+    writeVar("KM", programComment);
+  }
+  writeVar("KAT", "Kommentar");
+  writeVar("MNM", "Kommentar");
+
+  writeln("!");
+}
